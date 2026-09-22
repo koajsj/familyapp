@@ -1,0 +1,42 @@
+.DS_Store
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+
+# Python backend
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env
+.env.local
+.env.*
+!.env.example
+deployments/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+backups/
+media/
+uploads/
+tmp/
+
+# Secrets and deployment material must stay on the VPS / in GitHub Secrets.
+*.pem
+*.key
+*.p12
+*.pfx
+id_ed25519
+id_rsa
+
+# IDE
+.idea/
+.vscode/

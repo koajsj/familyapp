@@ -1,0 +1,59 @@
+name: Deploy production backend
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_commit:
+        description: Optional full or short commit SHA already present on the VPS
+        required: false
+        type: string
+
+concurrency:
+  group: familyapp-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${VPS_HOST:?Missing VPS_HOST}" "${VPS_USER:?Missing VPS_USER}" "${VPS_SSH_KEY:?Missing VPS_SSH_KEY}" "${VPS_KNOWN_HOSTS:?Missing VPS_KNOWN_HOSTS}"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          printf 'VPS_PORT=%s\n' "${VPS_PORT:-22}" >> "$GITHUB_ENV"
+
+      - name: Ask the VPS to run its single deployment path
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          # A push deploys that exact reviewed commit rather than whichever
+          # commit happens to be newest when the VPS receives the SSH call.
+          TARGET: ${{ inputs.target_commit || github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$TARGET" && ! "$TARGET" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+            echo "target_commit must be a Git SHA" >&2
+            exit 2
+          fi
+          target_arg=()
+          if [[ -n "$TARGET" ]]; then target_arg=("$TARGET"); fi
+          ssh -p "$VPS_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes "$VPS_USER@$VPS_HOST" \
+            sudo /opt/familyapp/deploy/update.sh "${target_arg[@]}"

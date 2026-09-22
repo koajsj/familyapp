@@ -1,0 +1,6 @@
+-- OBSOLETE REFERENCE ONLY — DO NOT EXECUTE.
+--
+-- The initial scaffold SQL represented the old JSON participant/import fields
+-- and lacked device, tombstone, sync-change and media tables.  The canonical
+-- migration is now backend/alembic/versions/0001_remote_sync.py, derived from
+-- backend/app/models/entities.py.  It has not been executed in this project.

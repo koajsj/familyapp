@@ -1,0 +1,82 @@
+services:
+  db:
+    image: postgres:16-alpine
+    profiles: ["local-db"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-familyapp}
+      POSTGRES_USER: ${POSTGRES_USER:-familyapp}
+      # This profile is never started for an external DATABASE_URL. Local mode
+      # is separately rejected by deploy/lib.sh unless a real password exists.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-profile-disabled}
+    volumes:
+      - familyapp-postgres:/var/lib/postgresql/data
+    networks: [private]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+
+  migrate:
+    build: .
+    image: familyapp-api:${IMAGE_TAG:-current}
+    env_file: .env
+    command: ["alembic", "upgrade", "head"]
+    networks: [private, edge]
+    restart: "no"
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+
+  api:
+    build: .
+    image: familyapp-api:${IMAGE_TAG:-current}
+    env_file: .env
+    restart: unless-stopped
+    init: true
+    networks: [private, edge]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/ready', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [edge]
+    stop_grace_period: 30s
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+
+networks:
+  private:
+    internal: true
+  edge:
+
+volumes:
+  familyapp-postgres:
+  caddy-data:
+  caddy-config:

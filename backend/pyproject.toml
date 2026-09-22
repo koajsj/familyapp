@@ -1,0 +1,12 @@
+[project]
+name = "familyapp-backend"
+version = "0.0.1"
+requires-python = ">=3.11"
+dependencies = ["fastapi>=0.115", "sqlalchemy>=2.0", "asyncpg>=0.30", "pydantic>=2.9", "alembic>=1.14", "boto3>=1.35", "uvicorn[standard]>=0.34"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100

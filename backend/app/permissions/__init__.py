@@ -1,0 +1,1 @@
+"""Permission namespace (scaffold only)."""
