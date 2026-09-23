@@ -15,14 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
-from ..member_identity import FAMILY_CHAT_ID, MEMBER_STATUS_IDS
+from ..member_identity import FAMILY_CHAT_ID, member_status_id
 from ..models import entities as models
 from ..repositories.sync import SyncRepository
 from ..schemas.contracts import ImportBatchRollbackOut, MutationAck, MutationConflict, MutationIn, SyncChangeOut
 
 
 VERSIONED_TYPES: dict[str, type[models.Base]] = {
-    "memberStatus": models.MemberStatus, "semester": models.Semester,
+    "member": models.Member, "memberStatus": models.MemberStatus, "semester": models.Semester,
     "schedule": models.Schedule, "scheduleException": models.ScheduleException,
     "calendarOverride": models.CalendarOverride, "importBatch": models.ImportBatch,
     "agenda": models.Agenda, "agendaException": models.AgendaException,
@@ -353,8 +353,12 @@ class SyncService:
             # Rollback history is sealed at creation. Mutable restore payloads
             # would turn a later rollback into a client-controlled overwrite.
             raise ValidationError("import batch items are immutable")
-        if mutation.entity_type == "memberStatus" and mutation.entity_id != MEMBER_STATUS_IDS.get(actor_id):
-            raise ValidationError("member status must use the fixed member status ID")
+        if mutation.entity_type == "member":
+            # Member provisioning and removal remain explicit control-plane
+            # operations. Sync may distribute members but never creates them.
+            raise ValidationError("member mutations are not supported")
+        if mutation.entity_type == "memberStatus" and mutation.entity_id != member_status_id(actor_id):
+            raise ValidationError("member status must use the stable member status ID")
         if mutation.entity_type in APPEND_ONLY_TYPES:
             return await self._apply_append(actor_id, device_id, model, existing, mutation)
         return await self._apply_versioned(actor_id, device_id, model, existing, mutation)
@@ -370,7 +374,7 @@ class SyncService:
         values = self._payload(model, mutation.payload)
         values["id"] = mutation.entity_id
         self._inject_actor_identity(mutation.entity_type, actor_id, values)
-        await self._authorize_create(mutation.entity_type, actor_id, values)
+        await self._authorize_create(mutation.entity_type, actor_id, device_id, values)
         record = model(**values)
         await self._validate_record(mutation.entity_type, record)
         self.session.add(record)
@@ -385,7 +389,7 @@ class SyncService:
             values = self._payload(model, mutation.payload)
             values["id"] = mutation.entity_id
             self._inject_actor_identity(mutation.entity_type, actor_id, values)
-            await self._authorize_create(mutation.entity_type, actor_id, values)
+            await self._authorize_create(mutation.entity_type, actor_id, device_id, values)
             record = model(**values)
             try:
                 await self._validate_record(mutation.entity_type, record)
@@ -507,7 +511,20 @@ class SyncService:
         if entity_type == "memo":
             values["updated_by"] = actor_id
 
-    async def _authorize_create(self, entity_type: str, actor_id: UUID, values: dict[str, Any]) -> None:
+    async def _authorize_create(
+        self, entity_type: str, actor_id: UUID, device_id: UUID, values: dict[str, Any],
+    ) -> None:
+        if entity_type == "locationSnapshot" and values.get("source") == "automatic":
+            source_device = await self.session.scalar(
+                select(models.Device).where(
+                    models.Device.id == device_id,
+                    models.Device.member_id == actor_id,
+                    models.Device.revoked_at.is_(None),
+                    models.Device.is_location_source.is_(True),
+                )
+            )
+            if source_device is None:
+                raise ForbiddenError("automatic location requires the active source device")
         if entity_type in {"scheduleException", "agendaException", "agendaParticipant", "importBatchItem"}:
             parent_type, parent_field = (("schedule", "schedule_id") if entity_type == "scheduleException" else ("agenda", "agenda_id") if entity_type in {"agendaException", "agendaParticipant"} else ("importBatch", "batch_id"))
             parent = await self.session.get(VERSIONED_TYPES[parent_type], values.get(parent_field))
@@ -671,6 +688,12 @@ class SyncService:
             await self._active_schedule(value("schedule_id"))
         if entity_type == "message":
             await self._validate_message_media(value)
+        if entity_type == "locationSnapshot":
+            accuracy, source = value("horizontal_accuracy"), value("source")
+            if accuracy is not None and (not isinstance(accuracy, (int, float)) or accuracy < 0):
+                raise ValidationError("horizontal_accuracy is invalid")
+            if source is not None and source not in {"automatic", "manual"}:
+                raise ValidationError("location source is invalid")
         if entity_type == "memberPlace" and value("enabled") and value("type") in {"home", "school"}:
             duplicate = await self.session.scalar(select(models.MemberPlace).where(
                 models.MemberPlace.member_id == value("member_id"),

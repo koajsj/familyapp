@@ -32,7 +32,11 @@ async def provision() -> None:
             if other is not None and other.id != member_id:
                 raise RuntimeError("fixed member key is already bound to another UUID")
             if existing is None:
-                session.add(Member(id=member_id, member_key=member_key, display_name=member_key, password_hash=hash_password(password)))
+                session.add(Member(
+                    id=member_id, member_key=member_key, display_name=member_key,
+                    normalized_display_name=member_key.casefold(), is_initial_member=True,
+                    password_hash=hash_password(password),
+                ))
         if await session.get(Chat, FAMILY_CHAT_ID) is None:
             session.add(Chat(id=FAMILY_CHAT_ID))
 

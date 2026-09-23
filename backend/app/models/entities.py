@@ -33,22 +33,100 @@ class SyncRecord:
 
 class Member(Base, SyncRecord):
     __tablename__ = "members"
-    __table_args__ = (CheckConstraint("member_key IN ('Sendai', 'Osaka', 'Kyoto')", name="ck_member_fixed_key"),)
     id: Mapped[UUID] = uuid_pk()
-    member_key: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    member_key: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    # Never use presentation text as a foreign key. This value is only the
+    # normalized uniqueness key for active family members.
+    normalized_display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    avatar_symbol: Mapped[str | None] = mapped_column(String(128))
+    is_initial_member: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+class MemberRemovalRequest(Base):
+    """Two-person approval record for removing a non-initial member.
+
+    This control-plane audit row is intentionally outside SyncChange.  The
+    resulting Member tombstone is the only replicated identity change.
+    """
+    __tablename__ = "member_removal_requests"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'approved', 'rejected', 'cancelled')", name="ck_member_removal_request_status"),
+        CheckConstraint("requester_id <> target_member_id", name="ck_member_removal_request_distinct_requester"),
+        Index(
+            "uq_member_removal_request_target_pending", "target_member_id", unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+    id: Mapped[UUID] = uuid_pk()
+    target_member_id: Mapped[UUID] = mapped_column(ForeignKey("members.id", ondelete="RESTRICT"), index=True, nullable=False)
+    requester_id: Mapped[UUID] = mapped_column(ForeignKey("members.id", ondelete="RESTRICT"), index=True, nullable=False)
+    approver_id: Mapped[UUID | None] = mapped_column(ForeignKey("members.id", ondelete="RESTRICT"), index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PendingRegistration(Base):
+    """Pre-membership request bound to one installation, never a sync record.
+
+    The applicant holds the opaque activation token; PostgreSQL retains only
+    its hash. A pending row cannot be used by normal auth or business routes.
+    """
+    __tablename__ = "pending_registrations"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'approved', 'rejected')", name="ck_pending_registration_status"),
+        CheckConstraint("expires_at > created_at", name="ck_pending_registration_expiry"),
+        Index(
+            "uq_pending_registration_normalized_name_pending", "normalized_display_name", unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "uq_pending_registration_installation_pending", "installation_id", unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+    id: Mapped[UUID] = uuid_pk()
+    display_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    normalized_display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    installation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # This is an opaque applicant capability, not an access/refresh token.
+    activation_token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    member_id: Mapped[UUID | None] = mapped_column(ForeignKey("members.id", ondelete="SET NULL"), index=True)
+    approved_by: Mapped[UUID | None] = mapped_column(ForeignKey("members.id", ondelete="SET NULL"), index=True)
+    rejected_by: Mapped[UUID | None] = mapped_column(ForeignKey("members.id", ondelete="SET NULL"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # A short post-commit replay window permits the same installation to
+    # recover one lost activation response without keeping the capability
+    # usable for the whole pending-registration lifetime.
+    activation_replay_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Device(Base):
     __tablename__ = "devices"
+    __table_args__ = (
+        # A revoked device may retain its historical flag, but no active
+        # member can have two automatic location-source devices.
+        Index(
+            "uq_device_active_location_source", "member_id", unique=True,
+            postgresql_where=text("is_location_source AND revoked_at IS NULL"),
+        ),
+    )
     id: Mapped[UUID] = uuid_pk()
     member_id: Mapped[UUID] = mapped_column(ForeignKey("members.id", ondelete="CASCADE"), index=True, nullable=False)
     installation_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="此设备")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_acked_sync_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_location_source: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class RefreshSession(Base):
@@ -79,6 +157,9 @@ class RecoveryCredential(Base):
     rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_allowed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Retained for audit without permitting a removed member to reuse the
+    # credential if its Member row is ever inspected by a control-plane path.
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class RecoverySession(Base):
@@ -304,13 +385,15 @@ class NoticeRead(Base, SyncRecord):
 
 class LocationSnapshot(Base):
     __tablename__ = "location_snapshots"
-    __table_args__ = (Index("ix_location_member_captured", "member_id", "captured_at"), CheckConstraint("latitude BETWEEN -90 AND 90", name="ck_location_latitude"), CheckConstraint("longitude BETWEEN -180 AND 180", name="ck_location_longitude"))
+    __table_args__ = (Index("ix_location_member_captured", "member_id", "captured_at"), CheckConstraint("latitude BETWEEN -90 AND 90", name="ck_location_latitude"), CheckConstraint("longitude BETWEEN -180 AND 180", name="ck_location_longitude"), CheckConstraint("horizontal_accuracy IS NULL OR horizontal_accuracy >= 0", name="ck_location_horizontal_accuracy"), CheckConstraint("source IS NULL OR source IN ('automatic', 'manual')", name="ck_location_source"))
     id: Mapped[UUID] = uuid_pk()
     member_id: Mapped[UUID] = mapped_column(ForeignKey("members.id", ondelete="CASCADE"), nullable=False)
     latitude: Mapped[float] = mapped_column(Float, nullable=False)
     longitude: Mapped[float] = mapped_column(Float, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     event_type: Mapped[str | None] = mapped_column(String(32))
+    horizontal_accuracy: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str | None] = mapped_column(String(16))
 
 
 class MemberPlace(Base, SyncRecord):

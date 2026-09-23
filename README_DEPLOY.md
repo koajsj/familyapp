@@ -15,8 +15,16 @@ uses any S3-compatible provider when configured; PostgreSQL stores metadata,
 not file bytes.
 
 Before bootstrap, create DNS A/AAAA records for `API_DOMAIN` and open 80/443
-(plus SSH) in both provider and host firewalls. On a fresh Debian VPS, install
-Git only so it can clone the repository, then run:
+(plus SSH) in both provider and host firewalls. On a fresh Debian VPS, run
+the installer from an interactive SSH terminal. It asks for the API domain,
+creates a private `.env` with random local database/JWT/account/invite secrets,
+and delegates to the existing bootstrap script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/koajsj/familyapp/main/install.sh | bash
+```
+
+The manual equivalent remains available:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
@@ -85,8 +93,9 @@ Restore is intentionally manual and should first be rehearsed on a disposable da
 
 ## GitHub Actions and maintenance timers
 
-Pushes to the configured production branch invoke this same `update.sh` over
-SSH; Actions does not duplicate backup, migration, rollback, or health logic.
+Production updates are triggered manually with the GitHub Actions workflow,
+which invokes this same `update.sh` over SSH. Publishing to `main` alone does
+not deploy. Actions does not duplicate backup, migration, rollback, or health logic.
 Set only `VPS_HOST`, `VPS_USER`, `VPS_PORT`, `VPS_SSH_KEY`, and pinned
 `VPS_KNOWN_HOSTS` in GitHub Secrets. Install
 `deploy/sudoers/familyapp-deploy` with `visudo` after replacing `DEPLOY_USER`;

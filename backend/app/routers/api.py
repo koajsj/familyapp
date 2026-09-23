@@ -5,20 +5,21 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..config import Settings
-from ..member_identity import MEMBER_STATUS_IDS
-from ..models.entities import Device, MemberStatus
-from ..repositories.auth import AuthRepository
-from ..schemas.contracts import AuthLoginIn, BootstrapOut, ImportBatchRollbackIn, ImportBatchRollbackOut, MediaCreateIn, MediaDownloadOut, MediaFinalizeIn, MediaUploadOut, MemberStatusIn, PullOut, PushIn, PushOut, RecoveryCredentialIn, RecoveryCredentialOut, RecoveryCredentialStatusOut, RecoveryDeviceSessionIn, RecoveryPasswordResetIn, RecoverySessionOut, RecoveryStartIn, RecoveryTakeoverIn, RefreshIn, TokenPairOut
+from ..member_identity import member_status_id
+from ..models.entities import Device, Member, MemberStatus
+from ..schemas.contracts import ApplicantRegistrationOut, AuthLoginIn, BootstrapOut, DeviceOut, ImportBatchRollbackIn, ImportBatchRollbackOut, MediaCreateIn, MediaDownloadOut, MediaFinalizeIn, MediaUploadOut, MemberDepartureIn, MemberRemovalDecisionIn, MemberRemovalRequestIn, MemberRemovalRequestOut, MemberStatusIn, PendingRegistrationOut, PullOut, PushIn, PushOut, RecoveryCredentialIn, RecoveryCredentialOut, RecoveryCredentialStatusOut, RecoveryDeviceSessionIn, RecoveryPasswordResetIn, RecoverySessionOut, RecoveryStartIn, RecoveryTakeoverIn, RefreshIn, RegistrationAccessIn, RegistrationActivationOut, RegistrationCreateIn, RegistrationCreatedOut, RegistrationDecisionIn, TokenPairOut
 from ..security import decode_access_token
 from ..services.auth_service import AuthService
 from ..services.recovery_service import RecoveryAttemptDenied, RecoveryService
 from ..services.media_service import MediaService
+from ..services.member_removal_service import MemberRemovalService
+from ..services.registration_service import RegistrationService
 from ..services.sync_service import ALL_TYPES, SyncService
 from ..services.websocket_service import CursorNotificationHub
 
@@ -70,7 +71,11 @@ async def current_principal(request: Request, session: Session, credentials: Ann
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid access token")
     principal = Principal(UUID(payload["sub"]), UUID(payload["device"]))
     device = await session.get(Device, principal.device_id)
-    if device is None or device.member_id != principal.member_id or device.revoked_at is not None:
+    member = await session.get(Member, principal.member_id)
+    if (
+        device is None or device.member_id != principal.member_id or device.revoked_at is not None
+        or member is None or member.deleted_at is not None
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="device session is unavailable")
     device.last_seen_at = datetime.now(UTC)
     return principal
@@ -93,8 +98,101 @@ async def readiness(session: Session) -> dict[str, str]:
 @auth_router.post("/login", response_model=TokenPairOut)
 async def login(payload: AuthLoginIn, request: Request, session: Session) -> TokenPairOut:
     require_remote_sync_enabled(request)
-    access, refresh, device_id = await AuthService(session, settings_for(request)).login(payload.member_key, payload.password, payload.installation_id)
+    access, refresh, device_id = await AuthService(session, settings_for(request)).login(
+        payload.member_key, payload.password, payload.installation_id, payload.device_name,
+    )
     return TokenPairOut(access_token=access, refresh_token=refresh, expires_in=settings_for(request).access_token_ttl_seconds, device_id=device_id)
+
+
+def registration_outcome(value) -> PendingRegistrationOut:
+    return PendingRegistrationOut(
+        id=value.id, display_name=value.display_name, status=value.status,
+        created_at=value.created_at, expires_at=value.expires_at,
+        member_id=value.member_id, approved_by=value.approved_by,
+        rejected_by=value.rejected_by, decided_at=value.decided_at,
+    )
+
+
+def applicant_registration_outcome(value) -> ApplicantRegistrationOut:
+    # A pending applicant can inspect only its own application state. Approval
+    # actor/member identifiers remain visible exclusively to authenticated reviewers.
+    return ApplicantRegistrationOut(
+        id=value.id, display_name=value.display_name, status=value.status,
+        created_at=value.created_at, expires_at=value.expires_at, decided_at=value.decided_at,
+    )
+
+
+def member_removal_outcome(value) -> MemberRemovalRequestOut:
+    return MemberRemovalRequestOut(
+        id=value.id, target_member_id=value.target_member_id,
+        requester_id=value.requester_id, approver_id=value.approver_id,
+        status=value.status, created_at=value.created_at, decided_at=value.decided_at,
+    )
+
+
+def device_outcome(value: Device, current_device_id: UUID) -> DeviceOut:
+    return DeviceOut(
+        id=value.id,
+        display_name=value.display_name,
+        first_seen_at=value.created_at,
+        last_seen_at=value.last_seen_at,
+        revoked_at=value.revoked_at,
+        is_current=value.id == current_device_id,
+        is_location_source=value.is_location_source,
+    )
+
+
+@auth_router.post("/registrations", response_model=RegistrationCreatedOut, status_code=status.HTTP_201_CREATED)
+async def submit_registration(payload: RegistrationCreateIn, request: Request, session: Session) -> RegistrationCreatedOut:
+    require_remote_sync_enabled(request)
+    registration, activation_token = await RegistrationService(session, settings_for(request)).submit(
+        display_name=payload.display_name, password=payload.password,
+        invite_code=payload.invite_code, installation_id=payload.installation_id,
+    )
+    result = applicant_registration_outcome(registration)
+    return RegistrationCreatedOut(**result.model_dump(), activation_token=activation_token)
+
+
+@auth_router.get("/registrations/{registration_id}", response_model=ApplicantRegistrationOut)
+async def registration_status(
+    registration_id: UUID, request: Request, session: Session,
+    installation_id: Annotated[str, Header(alias="X-FamilyApp-Installation-ID")],
+    activation_token: Annotated[str, Header(alias="X-FamilyApp-Registration-Token")],
+) -> ApplicantRegistrationOut:
+    # The applicant capability stays in a dedicated header; it is never
+    # promoted to an Authorization bearer credential or accepted by business APIs.
+    require_remote_sync_enabled(request)
+    registration = await RegistrationService(session, settings_for(request)).applicant_status(
+        registration_id, installation_id, activation_token,
+    )
+    return applicant_registration_outcome(registration)
+
+
+@auth_router.delete("/registrations/{registration_id}", response_model=ApplicantRegistrationOut)
+async def cancel_registration(
+    registration_id: UUID, payload: RegistrationAccessIn, request: Request, session: Session,
+) -> ApplicantRegistrationOut:
+    require_remote_sync_enabled(request)
+    registration = await RegistrationService(session, settings_for(request)).cancel(
+        registration_id, payload.installation_id, payload.activation_token,
+    )
+    return applicant_registration_outcome(registration)
+
+
+@auth_router.post("/registrations/{registration_id}/activate", response_model=RegistrationActivationOut)
+async def activate_registration(
+    registration_id: UUID, payload: RegistrationAccessIn, request: Request, session: Session,
+) -> RegistrationActivationOut:
+    require_remote_sync_enabled(request)
+    registration, (access, refresh, device_id) = await RegistrationService(session, settings_for(request)).activate(
+        registration_id, payload.installation_id, payload.activation_token, payload.device_name,
+    )
+    assert registration.member_id is not None
+    return RegistrationActivationOut(
+        access_token=access, refresh_token=refresh,
+        expires_in=settings_for(request).access_token_ttl_seconds,
+        device_id=device_id, member_id=registration.member_id,
+    )
 
 
 @auth_router.post("/refresh", response_model=TokenPairOut)
@@ -133,7 +231,7 @@ async def begin_recovery(payload: RecoveryStartIn, request: Request, session: Se
     require_remote_sync_enabled(request)
     try:
         authorization, token = await RecoveryService(session, settings_for(request)).begin(
-            payload.member_key, payload.recovery_secret, payload.purpose
+            payload.member_id, payload.recovery_secret, payload.purpose
         )
     except RecoveryAttemptDenied as error:
         # Persist the failed-attempt backoff before returning the generic
@@ -165,7 +263,7 @@ async def recover_new_device(
 ) -> TokenPairOut:
     require_remote_sync_enabled(request)
     access, refresh, device_id = await RecoveryService(session, settings_for(request)).issue_new_device_session(
-        recovery_session_id, payload.recovery_token, payload.installation_id
+        recovery_session_id, payload.recovery_token, payload.installation_id, payload.device_name,
     )
     return TokenPairOut(access_token=access, refresh_token=refresh, expires_in=settings_for(request).access_token_ttl_seconds, device_id=device_id)
 
@@ -177,8 +275,13 @@ async def account_takeover(
     require_remote_sync_enabled(request)
     access, refresh, device_id, _ = await RecoveryService(session, settings_for(request)).complete_takeover(
         recovery_session_id, payload.recovery_token, payload.new_password, payload.installation_id,
-        payload.recovery_secret,
+        payload.recovery_secret, payload.device_name,
     )
+    decoded = decode_access_token(access, settings_for(request).access_token_secret)
+    if decoded is None or not isinstance(decoded.get("sub"), str):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="invalid takeover session")
+    await session.commit()
+    await request.app.state.cursor_hub.disconnect_member(UUID(decoded["sub"]), except_device_id=device_id)
     return TokenPairOut(access_token=access, refresh_token=refresh, expires_in=settings_for(request).access_token_ttl_seconds, device_id=device_id)
 
 
@@ -186,10 +289,7 @@ async def account_takeover(
 async def save_my_status(payload: MemberStatusIn, principal: PrincipalDependency, request: Request, session: Session) -> dict[str, Any]:
     existing = await session.scalar(select(MemberStatus).where(MemberStatus.member_id == principal.member_id))
     if existing is None:
-        status_id = MEMBER_STATUS_IDS.get(principal.member_id)
-        if status_id is None:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="unknown fixed member")
-        existing = MemberStatus(id=status_id, member_id=principal.member_id, status_raw=payload.status, estimated_arrival=payload.estimated_arrival)
+        existing = MemberStatus(id=member_status_id(principal.member_id), member_id=principal.member_id, status_raw=payload.status, estimated_arrival=payload.estimated_arrival)
         session.add(existing)
     else:
         existing.status_raw = payload.status
@@ -201,16 +301,109 @@ async def save_my_status(payload: MemberStatusIn, principal: PrincipalDependency
     return {"id": str(existing.id), "version": existing.version, "cursor": change.seq}
 
 
-@member_router.delete("/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def revoke_device(device_id: UUID, principal: PrincipalDependency, session: Session) -> None:
-    device = await session.scalar(select(Device).where(Device.id == device_id).with_for_update())
-    if device is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="device not found")
-    if device.member_id != principal.member_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="device ownership required")
-    now = datetime.now(UTC)
-    device.revoked_at = now
-    await AuthRepository(session).revoke_device_refresh_sessions(device.id, now)
+@member_router.post("/me/leave", status_code=status.HTTP_204_NO_CONTENT)
+async def leave_family(
+    payload: MemberDepartureIn, principal: PrincipalDependency, request: Request, session: Session,
+) -> None:
+    # ``payload.confirmed`` is intentionally read to make the confirmation a
+    # required wire-level contract, rather than a UI-only convention.
+    assert payload.confirmed is True
+    cursor = await MemberRemovalService(session, settings_for(request)).leave(principal.member_id)
+    await session.commit()
+    await request.app.state.cursor_hub.disconnect_member(principal.member_id)
+    await request.app.state.cursor_hub.notify_latest_cursor(cursor)
+
+
+@member_router.post("/removal-requests", response_model=MemberRemovalRequestOut, status_code=status.HTTP_201_CREATED)
+async def request_member_removal(
+    payload: MemberRemovalRequestIn, principal: PrincipalDependency, request: Request, session: Session,
+) -> MemberRemovalRequestOut:
+    value = await MemberRemovalService(session, settings_for(request)).request_removal(
+        principal.member_id, payload.target_member_id,
+    )
+    return member_removal_outcome(value)
+
+
+@member_router.get("/removal-requests", response_model=list[MemberRemovalRequestOut])
+async def list_member_removal_requests(
+    principal: PrincipalDependency, request: Request, session: Session,
+) -> list[MemberRemovalRequestOut]:
+    del principal
+    return [member_removal_outcome(value) for value in await MemberRemovalService(session, settings_for(request)).reviewable()]
+
+
+@member_router.post("/removal-requests/{removal_request_id}/decision", response_model=MemberRemovalRequestOut)
+async def decide_member_removal(
+    removal_request_id: UUID, payload: MemberRemovalDecisionIn, principal: PrincipalDependency,
+    request: Request, session: Session,
+) -> MemberRemovalRequestOut:
+    value, cursor = await MemberRemovalService(session, settings_for(request)).decide(
+        removal_request_id, principal.member_id, payload.decision,
+    )
+    if cursor is not None:
+        await session.commit()
+        if value.status == "approved":
+            await request.app.state.cursor_hub.disconnect_member(value.target_member_id)
+        await request.app.state.cursor_hub.notify_latest_cursor(cursor)
+    return member_removal_outcome(value)
+
+
+@member_router.get("/join-requests", response_model=list[PendingRegistrationOut])
+async def list_join_requests(principal: PrincipalDependency, request: Request, session: Session) -> list[PendingRegistrationOut]:
+    # Any authenticated, active household member may review applications.
+    del principal
+    return [registration_outcome(value) for value in await RegistrationService(session, settings_for(request)).reviewable()]
+
+
+@member_router.post("/join-requests/{registration_id}/decision", response_model=PendingRegistrationOut)
+async def decide_join_request(
+    registration_id: UUID, payload: RegistrationDecisionIn, principal: PrincipalDependency,
+    request: Request, session: Session,
+) -> PendingRegistrationOut:
+    registration, cursor = await RegistrationService(session, settings_for(request)).decide(
+        registration_id, principal.member_id, payload.decision,
+    )
+    # Sync delivery is notified only after the member-creation transaction is
+    # durable. Rejected/idempotent decisions do not manufacture a SyncChange.
+    if cursor is not None:
+        await session.commit()
+        await request.app.state.cursor_hub.notify_latest_cursor(cursor)
+    return registration_outcome(registration)
+
+
+@member_router.get("/me/devices", response_model=list[DeviceOut])
+async def list_my_devices(principal: PrincipalDependency, request: Request, session: Session) -> list[DeviceOut]:
+    values = await AuthService(session, settings_for(request)).devices(principal.member_id)
+    return [device_outcome(value, principal.device_id) for value in values]
+
+
+@member_router.post("/me/devices/revoke-others", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_other_devices(principal: PrincipalDependency, request: Request, session: Session) -> None:
+    revoked_device_ids = await AuthService(session, settings_for(request)).revoke_other_devices(
+        principal.member_id, principal.device_id,
+    )
+    await session.commit()
+    for device_id in revoked_device_ids:
+        await request.app.state.cursor_hub.disconnect_device(principal.member_id, device_id)
+
+
+@member_router.post("/me/devices/current/location-source", status_code=status.HTTP_204_NO_CONTENT)
+async def select_current_location_source(
+    principal: PrincipalDependency, request: Request, session: Session,
+) -> None:
+    await AuthService(session, settings_for(request)).select_location_source(
+        principal.member_id, principal.device_id,
+    )
+
+
+@member_router.delete("/me/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
+@member_router.delete("/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT, include_in_schema=False)
+async def revoke_device(device_id: UUID, principal: PrincipalDependency, request: Request, session: Session) -> None:
+    # Keep the older path as a transport alias while routing both through the
+    # same ownership and refresh-session revocation boundary.
+    await AuthService(session, settings_for(request)).revoke_device(principal.member_id, device_id)
+    await session.commit()
+    await request.app.state.cursor_hub.disconnect_device(principal.member_id, device_id)
 
 
 @sync_router.post("/push", response_model=PushOut)
@@ -336,7 +529,11 @@ async def websocket_notifications(socket: WebSocket) -> None:
     try:
         async with factory() as session:
             device = await session.get(Device, device_id)
-            if device is None or device.member_id != member_id or device.revoked_at is not None:
+            member = await session.get(Member, member_id)
+            if (
+                device is None or device.member_id != member_id or device.revoked_at is not None
+                or member is None or member.deleted_at is not None
+            ):
                 await socket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return
             device.last_seen_at = datetime.now(UTC)
@@ -346,12 +543,12 @@ async def websocket_notifications(socket: WebSocket) -> None:
         return
 
     hub: CursorNotificationHub = socket.app.state.cursor_hub
-    await hub.connect(member_id, socket)
+    await hub.connect(member_id, device_id, socket)
     try:
         while True:
             await socket.receive()  # frames are ignored; REST pull is reliable sync.
     except WebSocketDisconnect:
-        hub.disconnect(member_id, socket)
+        hub.disconnect(member_id, device_id, socket)
 
 
 for group in (auth_router, recovery_router, member_router, sync_router, media_router, entity_router):

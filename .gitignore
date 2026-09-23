@@ -3,6 +3,11 @@ xcuserdata/
 *.xcuserstate
 DerivedData/
 build/
+*.xcresult/
+*.xcarchive/
+*.ipa
+.build/
+.swiftpm/
 
 # Python backend
 __pycache__/
@@ -25,6 +30,8 @@ deployments/
 *.db
 *.log
 backups/
+*.sql.gz
+*.bak
 media/
 uploads/
 tmp/

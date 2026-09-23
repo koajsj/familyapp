@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..errors import ConflictError, ForbiddenError, ValidationError
-from ..member_identity import MEMBER_IDS
 from ..models.entities import Member, RecoveryCredential, RecoverySession
 from ..repositories.recovery import RecoveryRepository
 from ..security import (
@@ -54,18 +53,18 @@ class RecoveryService:
 
     async def credential_status(self, member_id: UUID) -> int | None:
         credential = await self.repository.credential(member_id)
-        return credential.generation if credential is not None else None
+        return credential.generation if credential is not None and credential.invalidated_at is None else None
 
-    async def begin(self, member_key: str, recovery_secret: str, purpose: RecoveryPurpose) -> tuple[RecoverySession, str]:
+    async def begin(self, member_id: UUID, recovery_secret: str, purpose: RecoveryPurpose) -> tuple[RecoverySession, str]:
         self._validate_secret(recovery_secret)
-        member = await self.repository.member_for_key(member_key)
-        # Keep the response deliberately non-enumerating.  Member keys are
-        # fixed, but whether recovery was configured is sensitive state.
-        if member is None or member.id != MEMBER_IDS.get(member_key):
+        member = await self.repository.active_member(member_id)
+        # Keep the response deliberately non-enumerating; recovery state is
+        # sensitive even when the UUID came from a known family profile.
+        if member is None:
             raise RecoveryAttemptDenied("recovery is unavailable")
         now = datetime.now(UTC)
         credential = await self.repository.credential(member.id, lock=True)
-        if credential is None:
+        if credential is None or credential.invalidated_at is not None:
             raise RecoveryAttemptDenied("recovery is unavailable")
         if credential.next_allowed_at is not None and credential.next_allowed_at > now:
             raise ConflictError("recovery_cooldown")
@@ -99,17 +98,19 @@ class RecoveryService:
         await self.session.flush()
 
     async def issue_new_device_session(
-        self, recovery_session_id: UUID, token: str, installation_id: str,
+        self, recovery_session_id: UUID, token: str, installation_id: str, device_name: str | None = None,
     ) -> tuple[str, str, UUID]:
         authorization, member, _ = await self._consume(recovery_session_id, token, "new_device")
-        tokens = await AuthService(self.session, self.settings).issue_session(member, installation_id)
+        tokens = await AuthService(self.session, self.settings).issue_session(
+            member, installation_id, device_name=device_name,
+        )
         authorization.used_at = datetime.now(UTC)
         await self.session.flush()
         return tokens
 
     async def complete_takeover(
         self, recovery_session_id: UUID, token: str, new_password: str, installation_id: str,
-        new_recovery_secret: str,
+        new_recovery_secret: str, device_name: str | None = None,
     ) -> tuple[str, str, UUID, int]:
         authorization, member, credential = await self._consume(recovery_session_id, token, "account_takeover")
         self._validate_password(new_password)
@@ -127,6 +128,7 @@ class RecoveryService:
         await self.repository.invalidate_sessions(member.id, now)
         access, refresh, device_id = await AuthService(self.session, self.settings).issue_session(
             member, installation_id, reinstate_revoked_device=True, revoke_other_devices=True, now=now,
+            device_name=device_name,
         )
         await self.session.flush()
         return access, refresh, device_id, credential.generation
@@ -136,7 +138,14 @@ class RecoveryService:
     ) -> tuple[RecoverySession, Member, RecoveryCredential]:
         if not token or len(token) > 512:
             raise ForbiddenError("recovery authorization is invalid")
-        authorization = await self.repository.session_for_token(token_hash(token), lock=True)
+        presented_hash = token_hash(token)
+        candidate = await self.repository.session_for_token(presented_hash)
+        if candidate is None or candidate.id != recovery_session_id:
+            raise ForbiddenError("recovery authorization is invalid")
+        # Member removal locks Member before invalidating RecoverySession.
+        # Locking the session first here would invert that order and deadlock.
+        member = await self.session.get(Member, candidate.member_id, with_for_update=True)
+        authorization = await self.repository.session_for_token(presented_hash, lock=True)
         now = datetime.now(UTC)
         if (
             authorization is None or authorization.id != recovery_session_id
@@ -144,9 +153,13 @@ class RecoveryService:
             or authorization.expires_at <= now
         ):
             raise ForbiddenError("recovery authorization is invalid")
-        member = await self.session.get(Member, authorization.member_id, with_for_update=True)
+        if member is None or member.id != authorization.member_id or member.deleted_at is not None:
+            raise ForbiddenError("recovery authorization is invalid")
         credential = await self.repository.credential(authorization.member_id, lock=True)
-        if member is None or credential is None or credential.generation != authorization.recovery_generation:
+        if (
+            credential is None or credential.invalidated_at is not None
+            or credential.generation != authorization.recovery_generation
+        ):
             raise ForbiddenError("recovery authorization is invalid")
         return authorization, member, credential
 

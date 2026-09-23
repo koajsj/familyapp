@@ -7,11 +7,13 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib.sh"
 require_root
 install_prerequisites
 for command in docker git curl flock; do require_command "$command"; done
-ensure_clean_checkout
-ensure_expected_origin
 validate_environment
 install_optional_clients
 prepare_directories
+exec 9>"$STATE_DIR/deploy.lock"
+flock -n 9 || die "Another deployment is already running."
+ensure_clean_checkout
+ensure_expected_origin
 require_disk_space
 
 target="$(git -C "$ROOT_DIR" rev-parse --verify HEAD)"

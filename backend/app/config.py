@@ -20,6 +20,8 @@ class Settings:
     access_token_ttl_seconds: int
     refresh_token_ttl_seconds: int
     recovery_session_ttl_seconds: int
+    invite_code: str
+    pending_registration_ttl_seconds: int
     sync_retention_days: int
     family_timezone: str
     media_backend: str
@@ -67,6 +69,14 @@ class Settings:
         recovery_session_ttl_seconds = int(os.environ.get("FAMILYAPP_RECOVERY_SESSION_TTL_SECONDS", "600"))
         if not 60 <= recovery_session_ttl_seconds <= 3_600:
             raise ValueError("FAMILYAPP_RECOVERY_SESSION_TTL_SECONDS must be 60...3600")
+        invite_code = os.environ.get("FAMILYAPP_INVITE_CODE", "zhangsan")
+        if not invite_code.strip() or len(invite_code) > 256:
+            raise ValueError("FAMILYAPP_INVITE_CODE must contain 1...256 characters")
+        pending_registration_ttl_seconds = int(
+            os.environ.get("FAMILYAPP_PENDING_REGISTRATION_TTL_SECONDS", "604800")
+        )
+        if not 3_600 <= pending_registration_ttl_seconds <= 2_592_000:
+            raise ValueError("FAMILYAPP_PENDING_REGISTRATION_TTL_SECONDS must be 3600...2592000")
         object_prefix = os.environ.get("FAMILYAPP_MEDIA_OBJECT_PREFIX", "familyapp/private").strip("/")
         if not object_prefix:
             raise ValueError("FAMILYAPP_MEDIA_OBJECT_PREFIX must not be empty")
@@ -85,6 +95,8 @@ class Settings:
             access_token_ttl_seconds=int(os.environ.get("FAMILYAPP_ACCESS_TOKEN_TTL_SECONDS", "900")),
             refresh_token_ttl_seconds=int(os.environ.get("FAMILYAPP_REFRESH_TOKEN_TTL_SECONDS", "2592000")),
             recovery_session_ttl_seconds=recovery_session_ttl_seconds,
+            invite_code=invite_code,
+            pending_registration_ttl_seconds=pending_registration_ttl_seconds,
             # Zero deliberately disables pruning; positive values retain
             # acknowledged changes for at least this many days.
             sync_retention_days=retention_days,

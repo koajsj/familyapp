@@ -65,3 +65,15 @@ uses the normal Device + access/refresh issuance path; account takeover rotates
 the verifier generation and revokes other devices and refresh sessions in the
 same transaction. Recovery records are deliberately absent from SyncChange and
 client backups.
+
+## Invitation and member approval control plane
+
+`FAMILYAPP_INVITE_CODE` only permits `POST /v1/auth/registrations` to create a
+short-lived, installation-bound pending application. It never creates a
+Member or bearer session. Any authenticated active member can review pending
+requests at `/v1/members/join-requests`; approval atomically creates the UUID
+Member and its member SyncChange. The applicant must then prove its stored
+one-time registration capability from that same installation to activate the
+existing Device/access/refresh session path. Pending records, their password
+verifiers, and activation-token hashes are control-plane data: they never
+enter SyncChange or client backup exports.

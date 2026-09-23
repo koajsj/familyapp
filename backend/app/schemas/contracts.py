@@ -22,9 +22,57 @@ class Page(BaseModel, Generic[T]):
 
 
 class AuthLoginIn(BaseModel):
-    member_key: Literal["Sendai", "Osaka", "Kyoto"]
+    # Legacy initial-member keys remain accepted; dynamic members submit their
+    # normalized display-name identifier through this wire-compatible field.
+    member_key: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=1, max_length=256)
     installation_id: str = Field(min_length=8, max_length=128)
+    device_name: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class RegistrationCreateIn(BaseModel):
+    display_name: str = Field(min_length=1, max_length=160)
+    password: str = Field(min_length=8, max_length=256)
+    confirm_password: str = Field(min_length=8, max_length=256)
+    invite_code: str = Field(min_length=1, max_length=256)
+    installation_id: str = Field(min_length=8, max_length=128)
+
+    @model_validator(mode="after")
+    def matching_passwords(self) -> "RegistrationCreateIn":
+        if self.password != self.confirm_password:
+            raise ValueError("password confirmation does not match")
+        return self
+
+
+class RegistrationAccessIn(BaseModel):
+    installation_id: str = Field(min_length=8, max_length=128)
+    activation_token: str = Field(min_length=32, max_length=512)
+    device_name: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class ApplicantRegistrationOut(BaseModel):
+    id: UUID
+    display_name: str
+    status: Literal["pending", "approved", "rejected"]
+    created_at: datetime
+    expires_at: datetime
+    decided_at: datetime | None = None
+
+
+class PendingRegistrationOut(ApplicantRegistrationOut):
+    member_id: UUID | None = None
+    approved_by: UUID | None = None
+    rejected_by: UUID | None = None
+
+
+class RegistrationCreatedOut(ApplicantRegistrationOut):
+    # Returned exactly once to the applicant and retained locally in a
+    # device-only Keychain item. It never grants business API access.
+    activation_token: str
+
+
+class RegistrationDecisionIn(BaseModel):
+    decision: Literal["approved", "rejected"]
 
 
 class RefreshIn(BaseModel):
@@ -37,6 +85,10 @@ class TokenPairOut(BaseModel):
     token_type: Literal["bearer"] = "bearer"
     expires_in: int = Field(gt=0)
     device_id: UUID
+
+
+class RegistrationActivationOut(TokenPairOut):
+    member_id: UUID
 
 
 class RecoveryCredentialIn(BaseModel):
@@ -54,7 +106,7 @@ class RecoveryCredentialStatusOut(BaseModel):
 
 
 class RecoveryStartIn(RecoveryCredentialIn):
-    member_key: Literal["Sendai", "Osaka", "Kyoto"]
+    member_id: UUID
     purpose: Literal["forgot_password", "new_device", "account_takeover"]
 
 
@@ -76,6 +128,7 @@ class RecoveryPasswordResetIn(RecoveryCompletionIn):
 
 class RecoveryDeviceSessionIn(RecoveryCompletionIn):
     installation_id: str = Field(min_length=8, max_length=128)
+    device_name: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class RecoveryTakeoverIn(BaseModel):
@@ -83,13 +136,50 @@ class RecoveryTakeoverIn(BaseModel):
     installation_id: str = Field(min_length=8, max_length=128)
     recovery_secret: str = Field(min_length=40, max_length=512)
     new_password: str = Field(min_length=8, max_length=256)
+    device_name: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class MemberOut(BaseModel):
     id: UUID
-    member_key: Literal["Sendai", "Osaka", "Kyoto"]
+    member_key: str
     display_name: str
+    avatar_symbol: str | None = None
+    is_initial_member: bool
     version: int
+
+
+class MemberRemovalRequestIn(BaseModel):
+    target_member_id: UUID
+
+
+class MemberDepartureIn(BaseModel):
+    # Explicit server-side acknowledgement prevents accidental destructive
+    # calls even if a client UI confirmation is bypassed.
+    confirmed: Literal[True]
+
+
+class MemberRemovalDecisionIn(BaseModel):
+    decision: Literal["approved", "rejected"]
+
+
+class MemberRemovalRequestOut(BaseModel):
+    id: UUID
+    target_member_id: UUID
+    requester_id: UUID
+    approver_id: UUID | None = None
+    status: Literal["pending", "approved", "rejected", "cancelled"]
+    created_at: datetime
+    decided_at: datetime | None = None
+
+
+class DeviceOut(BaseModel):
+    id: UUID
+    display_name: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    revoked_at: datetime | None = None
+    is_current: bool
+    is_location_source: bool
 
 
 class MemberStatusIn(BaseModel):
