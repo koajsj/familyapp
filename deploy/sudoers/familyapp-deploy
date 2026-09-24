@@ -1,0 +1,5 @@
+# Install with visudo after replacing DEPLOY_USER with the dedicated GitHub
+# deployment account. This account may run only the guarded update script.
+# update.sh validates its optional argument as a Git SHA before acting.
+Cmnd_Alias FAMILYAPP_DEPLOY = /opt/familyapp/deploy/update.sh *
+DEPLOY_USER ALL=(root) NOPASSWD: FAMILYAPP_DEPLOY

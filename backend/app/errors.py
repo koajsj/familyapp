@@ -16,3 +16,7 @@ class ValidationError(DomainError):
 
 class NotFoundError(DomainError):
     pass
+
+
+class MediaUnavailableError(DomainError):
+    """The optional private object store is not configured or unavailable."""

@@ -1,0 +1,143 @@
+FamilyApp 服务器部署说明（大白话版）
+=================================
+
+一、先知道这些东西是什么
+----------------------
+VPS 就是一台放在机房里的 Debian Linux 电脑。域名是容易记的网址，例如
+api.example.com；DNS 是把网址指向 VPS 公网 IP 的记录。SSH 是你在自己电脑上
+安全登录 VPS 的方式。
+
+Docker 把程序装进容器。Caddy 负责 HTTPS 证书、80/443 端口和转发请求；FastAPI
+是后端程序；PostgreSQL 是数据库。外网只能看到 Caddy，绝不要开放 8000 或 5432。
+媒体文件可放进任意兼容 S3 的私有对象存储，不绑定某一家云厂商。
+
+现在 iPhone App 仍是 localOnly。部署服务器以后，App 也不会自动登录、同步、上传
+消息/位置/媒体、发 WebSocket 或刷新 Token。不要因为服务器已经启动就切换 remoteSync。
+
+二、部署前准备
+--------------
+1. 准备 Debian VPS、域名和 SSH 登录方式。
+2. 在域名 DNS 后台添加 A（需要 IPv6 再加 AAAA）记录：
+   api.example.com 指向 VPS IP。
+3. 在云防火墙和 Debian 防火墙只放行 TCP 22、80、443。不要放行 8000、5432。
+4. 先装 Git（因为拉代码本身需要它），然后拉代码：
+
+   sudo apt-get update && sudo apt-get install -y git
+   sudo mkdir -p /opt && sudo chown "$USER" /opt
+   git clone https://github.com/koajsj/familyapp.git /opt/familyapp
+   cd /opt/familyapp
+   cp .env.example .env
+   chmod 600 .env
+   nano .env
+
+三、.env 怎么填
+---------------
+`.env` 是只放在 VPS 上的私密配置，不能传 GitHub、聊天记录、截图。脚本会拒绝示例
+值、过短 JWT、通配符 CORS/Host 和权限过宽的 `.env`。
+
+必须确认：
+- APP_ENV=production，DEBUG=false。
+- API_DOMAIN 和 ALLOWED_HOSTS 写你的真实域名。
+- DATABASE_URL 写 PostgreSQL 地址，JWT_SECRET 至少 32 个随机字符。
+- FAMILYAPP_FAMILY_TIMEZONE、REMOTE_SYNC_ENABLED、DEPLOY_BRANCH、DEPLOY_REMOTE 正确。
+- 本机数据库保留 DATABASE_URL 中的主机 db，并设置强的 POSTGRES_*；托管数据库就
+  换成完整 DATABASE_URL，本机 db 不会启动。
+- 需要媒体才设置 FAMILYAPP_MEDIA_BACKEND=s3 和 FAMILYAPP_MEDIA_S3_*；Bucket 必须
+  私有。暂时不用就保持 unconfigured。
+- BACKUP_DIR、BACKUP_DAILY_RETENTION、BACKUP_WEEKLY_RETENTION、
+  BACKUP_MONTHLY_RETENTION 控制本地备份。S3_BACKUP_URI 非空时，备份成功落盘后才上传。
+
+密码、JWT、数据库 URL 里的密码、S3 Secret、Access/Refresh Token 都不能泄露。
+
+四、第一次部署
+--------------
+DNS 已生效、80/443 已放行后运行：
+
+   cd /opt/familyapp
+   sudo ./deploy/bootstrap.sh
+
+脚本会检查这是不是 Debian、是否用 sudo、安装 Docker Engine 和 Compose Plugin、检查
+配置和磁盘空间。随后按需启动本机 PostgreSQL，构建镜像，运行 Alembic migration，
+启动 FastAPI 和 Caddy，最后访问 https://你的域名/health 和 /ready。失败会退出，不会
+说成成功；重复执行不会删除 `.env`、数据库卷或已有生产数据。
+
+五、平时怎么看和操作
+--------------------
+查看容器：
+   cd /opt/familyapp
+   docker compose --env-file .env -f docker-compose.prod.yml ps
+
+看日志：
+   docker compose --env-file .env -f docker-compose.prod.yml logs -f api caddy
+
+检查 HTTPS：
+   sudo ./deploy/healthcheck.sh
+
+手动更新：
+   sudo ./deploy/update.sh
+或指定一个属于 DEPLOY_REMOTE/DEPLOY_BRANCH 的 Git SHA：
+   sudo ./deploy/update.sh abcdef1
+
+update.sh 会加锁，拒绝修改过、暂存或多余文件的部署目录，检查磁盘，先备份，再拉取
+明确 commit、构建、迁移、重启和健康检查。不要自己用 `git pull && docker compose up`。
+每次成功或失败都在 /opt/familyapp/deployments/ 留一份不含 Secret 的记录。
+
+六、备份、恢复与回滚
+--------------------
+手动备份：
+   sudo ./deploy/backup.sh
+
+备份是压缩 SQL 文件，默认放 /var/backups/familyapp，权限 0600。每天/每周/每月保留
+数量按 `.env` 设置。上传对象存储失败时，本机刚成功的备份不会删除。
+
+恢复必须人工做：先停止写入、再额外备份、先在临时数据库演练，确认后才把某个
+`.sql.gz` 解压并用 psql 导入。项目不会自动 restore。
+
+回滚代码：
+   sudo ./deploy/rollback.sh
+或：
+   sudo ./deploy/rollback.sh <旧commit>
+
+回滚从不运行 Alembic downgrade。若新 migration 已经可能让旧代码不兼容，脚本会停下；
+必须人工确认兼容，才可在 `.env` 把 ROLLBACK_SCHEMA_COMPATIBLE=true 后重试。
+
+七、GitHub push 后发生什么
+-------------------------
+`.github/workflows/deploy.yml` 只 SSH 到 VPS 并调用唯一的
+`/opt/familyapp/deploy/update.sh <准确 Git SHA>`。Actions 不会自己做备份、migration、
+健康检查或 rollback，避免出现两套部署逻辑。
+
+GitHub Secrets 只需要 VPS_HOST、VPS_USER、VPS_PORT、VPS_SSH_KEY、VPS_KNOWN_HOSTS。
+其中 VPS_KNOWN_HOSTS 是服务器指纹，不能关闭校验。数据库/JWT/S3 Secret 只留 VPS
+`.env`。把 deploy/sudoers/familyapp-deploy 中的 DEPLOY_USER 换成部署账号后，用 visudo
+安装；不要给 GitHub 部署账号完整 root shell。
+
+八、定时备份和媒体清理（可选）
+------------------------------
+模板在 deploy/systemd/。先人工检查路径，然后安装：
+
+   sudo cp deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now familyapp-backup.timer
+   sudo systemctl enable --now familyapp-media-cleanup.timer
+
+查看定时器：
+   systemctl list-timers 'familyapp-*'
+
+媒体清理调用已有的 MediaStorage 清理逻辑，处理过期未完成上传、孤儿对象和丢失对象。
+它不走公开 API；对象存储未配置时会明确跳过。定时任务失败不会让主 API 停止。
+
+九、VPS 重启或 App 连不上怎么办
+-------------------------------
+Docker restart policy 会恢复本机 PostgreSQL、FastAPI 和 Caddy，不需要再跑 bootstrap。
+重启后运行 `sudo ./deploy/healthcheck.sh`。
+
+连不上时按顺序查：DNS 是否指向正确 IP；80/443 防火墙；容器状态；Caddy/API 日志；
+`.env` 的域名和数据库配置；外部数据库的网络/TLS/白名单；对象存储私有 Bucket、端点
+和直传 CORS。不要为了排错开放 8000 或 5432。
+
+十、什么时候才算可以上线和开启 remoteSync
+--------------------------------------------
+脚本存在不等于服务器已经验证成功。至少要在真实 VPS 验证 HTTPS/证书、migration、
+备份恢复、对象存储、权限、多设备同步、离线恢复和故障回滚。iOS remoteSync 还要完成
+独立的实际集成验收；在那之前，继续保持 localOnly。

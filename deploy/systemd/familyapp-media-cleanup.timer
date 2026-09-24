@@ -1,0 +1,10 @@
+[Unit]
+Description=Run FamilyApp private media cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 03:45:00 UTC
+Persistent=true
+Unit=familyapp-media-cleanup.service
+
+[Install]
+WantedBy=timers.target

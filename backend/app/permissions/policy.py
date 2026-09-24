@@ -23,3 +23,7 @@ def require_memo_delete(actor_id: UUID, creator_id: UUID) -> None:
 
 def require_member_place_owner(actor_id: UUID, member_id: UUID) -> None:
     require_owner(actor_id, member_id)
+
+
+def require_member_status_owner(actor_id: UUID, member_id: UUID) -> None:
+    require_owner(actor_id, member_id)

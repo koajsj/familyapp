@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-enum MemberID: String, CaseIterable, Codable, Identifiable {
+nonisolated enum MemberID: String, CaseIterable, Codable, Identifiable {
     case sendai = "Sendai", osaka = "Osaka", kyoto = "Kyoto"
     var id: String { rawValue }
     var color: Color {
@@ -11,13 +11,65 @@ enum MemberID: String, CaseIterable, Codable, Identifiable {
         case .kyoto: return .indigo
         }
     }
-    var symbol: String {
-        switch self { case .sendai: return "person.crop.circle.fill"; case .osaka: return "person.crop.circle.fill"; case .kyoto: return "person.crop.circle.fill" }
+    /// Immutable family identities shared with the future backend. Display
+    /// names remain local presentation data; sync never matches by a nickname
+    /// or the order of this enum.
+    var remoteUUID: UUID {
+        switch self {
+        case .sendai: UUID(uuidString: "e7fda0a8-08b2-5ee0-b4ef-fcd4a381591a")!
+        case .osaka: UUID(uuidString: "62d93a27-bb70-57b4-8d10-c43e80f612d1")!
+        case .kyoto: UUID(uuidString: "f24af69c-3fd8-59bc-ab96-0b2610a1a4e5")!
+        }
+    }
+
+    static func from(remoteUUID: UUID) -> MemberID? {
+        allCases.first { $0.remoteUUID == remoteUUID }
+    }
+
+    /// The backend's one-status-per-member rows also need stable entity IDs,
+    /// because the local status model is keyed by memberID rather than UUID.
+    var remoteStatusUUID: UUID {
+        switch self {
+        case .sendai: UUID(uuidString: "1e0f6ad0-5b92-5ae3-9257-6e10948fb2e1")!
+        case .osaka: UUID(uuidString: "f61c09e6-43a5-5ee3-b413-595b4df7df88")!
+        case .kyoto: UUID(uuidString: "2b0d2442-1e9d-5fd4-bbd9-2d1f31859f9d")!
+        }
     }
 }
 
+/// Compatibility bridge while the local store moves from the original three
+/// display-keyed records to stable member UUIDs.  The three initial keys stay
+/// untouched so existing SwiftData rows keep their identity; later members use
+/// their remote UUID string as the local business key.
+nonisolated enum MemberIdentity {
+    static func remoteUUID(for localMemberID: String) -> UUID? {
+        MemberID(rawValue: localMemberID)?.remoteUUID ?? UUID(uuidString: localMemberID)
+    }
+
+    static func localMemberID(for remoteUUID: UUID) -> String {
+        MemberID.from(remoteUUID: remoteUUID)?.rawValue ?? remoteUUID.uuidString.lowercased()
+    }
+
+    static func isInitialMember(_ localMemberID: String) -> Bool {
+        MemberID(rawValue: localMemberID) != nil
+    }
+
+    static func color(for localMemberID: String) -> Color {
+        if let initial = MemberID(rawValue: localMemberID) { return initial.color }
+        let palette: [Color] = [.cyan, .mint, .purple, .orange, .pink, .indigo]
+        let index = localMemberID.utf8.reduce(0) { ($0 &* 31 &+ Int($1)) % palette.count }
+        return palette[index]
+    }
+}
+
+/// Backend-only shared chat identity. It is deterministic so two devices do
+/// not create parallel family chat rows when remote sync is enabled later.
+enum FamilyRemoteIdentity {
+    static let sharedChatUUID = UUID(uuidString: "e6e4f080-93bd-5d58-a48d-1f18d1390217")!
+}
+
 enum ScheduleKind: String, CaseIterable, Codable { case course, groupMeeting }
-enum WeekType: String, CaseIterable, Codable { case everyWeek, oddWeek, evenWeek }
+enum WeekType: String, CaseIterable, Codable, Sendable { case everyWeek, oddWeek, evenWeek }
 enum ExceptionKind: String, Codable { case cancelled, rescheduled, modified }
 enum ExceptionScope: String, Codable { case thisOccurrence, thisAndFuture, entireSeries }
 enum CalendarOverrideKind: String, CaseIterable, Codable, Hashable { case holiday, normal, mappedWeekday }
@@ -25,13 +77,58 @@ enum AgendaKind: String, CaseIterable, Codable { case normal, exam, assignmentDe
 enum AgendaRecurrence: String, CaseIterable, Codable { case none, daily, weekly }
 enum PreparationState: String, Codable { case waiting, preparing }
 enum CompletionState: String, Codable { case pending, completed, overdue }
-enum MessageKind: String, Codable { case text, image, audio, recalled }
+enum MessageKind: String, Codable { case text, image, audio, file, recalled }
 enum ReceiptStatus: String, Codable { case sending, sent, delivered, read, failed }
 enum PlaceKind: String, CaseIterable, Codable { case home, school, company, custom }
+enum SafetyStatus: String, CaseIterable, Codable, Hashable { case allGood, headingHome, atHome, atSchool }
+/// Kept separate from an optional persisted raw value so stores written before
+/// automatic sharing continue to treat their existing snapshots as manual.
+enum LocationSnapshotSource: String, Codable, Sendable { case automatic, manual }
+
+extension ExceptionKind {
+    var localizedName: String {
+        switch self { case .cancelled: "取消"; case .rescheduled: "调期"; case .modified: "临时修改" }
+    }
+}
+
+extension ExceptionScope {
+    var localizedName: String {
+        switch self { case .thisOccurrence: "仅本次"; case .thisAndFuture: "本次及以后"; case .entireSeries: "整个系列" }
+    }
+}
 
 extension PlaceKind {
     var localizedName: String {
         switch self { case .home: "家"; case .school: "学校"; case .company: "公司"; case .custom: "自定义地点" }
+    }
+}
+
+extension SafetyStatus {
+    var localizedName: String {
+        switch self {
+        case .allGood: "一切正常"
+        case .headingHome: "预计到家"
+        case .atHome: "已到家"
+        case .atSchool: "已到学校"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .allGood: "checkmark.shield.fill"
+        case .headingHome: "house.and.flag.fill"
+        case .atHome: "house.fill"
+        case .atSchool: "building.columns.fill"
+        }
+    }
+}
+
+extension LocationSnapshotSource {
+    var localizedName: String {
+        switch self {
+        case .automatic: "自动"
+        case .manual: "手动"
+        }
     }
 }
 
@@ -46,9 +143,9 @@ extension AgendaItemModel {
     var foodReadReceipts: [FoodReadReceipt] {
         (foodReadAtRecords ?? []).compactMap { record in
             let parts = record.split(separator: "|", maxSplits: 1).map(String.init)
-            guard parts.count == 2, MemberID(rawValue: parts[0]) != nil, let timestamp = TimeInterval(parts[1]) else { return nil }
+            guard parts.count == 2, !parts[0].isEmpty, let timestamp = TimeInterval(parts[1]) else { return nil }
             return FoodReadReceipt(memberID: parts[0], readAt: Date(timeIntervalSince1970: timestamp))
-        }.sorted { $0.readAt < $1.readAt }
+        }.filter { participantIDs.contains($0.memberID) }.sorted { $0.readAt < $1.readAt }
     }
 }
 
@@ -139,7 +236,7 @@ extension CalendarOverrideKind {
 
 /// The compact calendar is a presentation of these real wall-clock ranges.
 /// Conflict detection never uses the template; it always uses the stored times.
-enum ClassPeriodTemplate: Int, CaseIterable, Identifiable {
+nonisolated enum ClassPeriodTemplate: Int, CaseIterable, Identifiable {
     case morningOne, morningTwo, afternoonOne, afternoonTwo, eveningOne, eveningTwo
     var id: Int { rawValue }
     var title: String { ["上午①", "上午②", "下午①", "下午②", "晚上①", "晚上②"][rawValue] }
@@ -184,7 +281,20 @@ struct BusyInterval: Identifiable, Equatable {
     let start: Date
     let end: Date
     let source: String
-    func overlaps(_ other: BusyInterval) -> Bool { start < other.end && other.start < end }
+    var category: BusyCategory = .course
+}
+
+enum BusyCategory: String, Codable {
+    case course, groupMeeting, exam, normalAgenda
+
+    var localizedName: String {
+        switch self {
+        case .course: "课程"
+        case .groupMeeting: "组会"
+        case .exam: "考试"
+        case .normalAgenda: "普通日程"
+        }
+    }
 }
 
 struct AvailabilitySlot: Identifiable, Equatable {
@@ -192,6 +302,28 @@ struct AvailabilitySlot: Identifiable, Equatable {
     let start: Date
     let end: Date
     let participants: [String]
+}
+
+struct CoordinationPreferences: Equatable {
+    var avoidEarly: Bool
+    var avoidLate: Bool
+    var avoidMeals: Bool
+    var avoidBeforeExam: Bool
+}
+
+struct MemberAvailabilityDetail: Identifiable {
+    let memberID: String
+    let intervals: [BusyInterval]
+    var id: String { memberID }
+    var isBusy: Bool { !intervals.isEmpty }
+}
+
+struct DataHealthIssue: Identifiable {
+    enum Severity: Equatable { case warning, error }
+    let id = UUID()
+    let severity: Severity
+    let message: String
+    let symbol: String
 }
 
 enum FamilyFormatters {
@@ -204,4 +336,18 @@ enum FamilyFormatters {
     static let day: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateStyle = .medium; f.timeStyle = .none; return f
     }()
+}
+
+/// One presentation rule for all map surfaces. A stale timestamp only changes
+/// its wording; it never changes whether a snapshot remains valid business data.
+enum FamilyRelativeTime {
+    static func locationUpdated(at timestamp: Date, now: Date = .now) -> String {
+        let seconds = max(0, now.timeIntervalSince(timestamp))
+        if seconds < 60 { return "刚刚" }
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes)分钟前" }
+        let hours = Int(seconds / 3_600)
+        if hours < 24 { return "\(hours)小时前" }
+        return "\(Int(seconds / 86_400))天前"
+    }
 }
