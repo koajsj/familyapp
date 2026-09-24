@@ -28,12 +28,11 @@ The manual equivalent remains available:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-sudo mkdir -p /opt && sudo chown "$USER" /opt
-git clone https://github.com/koajsj/familyapp.git /opt/familyapp
+sudo git clone https://github.com/koajsj/familyapp.git /opt/familyapp
 cd /opt/familyapp
-cp .env.example .env
-chmod 600 .env
-nano .env
+sudo cp .env.example .env
+sudo chmod 600 .env
+sudo nano .env
 sudo ./deploy/bootstrap.sh
 ```
 
@@ -51,6 +50,8 @@ Fill real values in VPS-only `.env`; it is ignored by Git and must be `0600`.
 `DATABASE_URL`, `JWT_SECRET`, `FAMILYAPP_FAMILY_TIMEZONE`, and
 `REMOTE_SYNC_ENABLED` are checked by scripts. `CORS_ORIGINS` is empty unless a
 specific HTTPS web origin exists; wildcard hosts/origins are rejected.
+When remote sync is enabled, replace the example `FAMILYAPP_INVITE_CODE` with a
+strong private value; the deployment preflight rejects the example value.
 
 For local PostgreSQL, retain host `db` in `DATABASE_URL` and set strong
 `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD`. For hosted PostgreSQL,

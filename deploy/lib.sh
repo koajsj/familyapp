@@ -155,6 +155,7 @@ validate_environment() {
     [[ "$remote_enabled" == "true" || "$remote_enabled" == "false" ]] || die "REMOTE_SYNC_ENABLED must be true or false."
     if [[ "$remote_enabled" == "true" ]]; then
         require_secret FAMILYAPP_FIXED_MEMBER_PASSWORD 12
+        require_secret FAMILYAPP_INVITE_CODE 12
     fi
     if uses_local_database; then
         require_non_placeholder POSTGRES_DB 1

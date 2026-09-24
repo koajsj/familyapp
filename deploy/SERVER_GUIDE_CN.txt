@@ -23,12 +23,11 @@ Docker 把程序装进容器。Caddy 负责 HTTPS 证书、80/443 端口和转�
 4. 先装 Git（因为拉代码本身需要它），然后拉代码：
 
    sudo apt-get update && sudo apt-get install -y git
-   sudo mkdir -p /opt && sudo chown "$USER" /opt
-   git clone https://github.com/koajsj/familyapp.git /opt/familyapp
+   sudo git clone https://github.com/koajsj/familyapp.git /opt/familyapp
    cd /opt/familyapp
-   cp .env.example .env
-   chmod 600 .env
-   nano .env
+   sudo cp .env.example .env
+   sudo chmod 600 .env
+   sudo nano .env
 
 三、.env 怎么填
 ---------------
@@ -40,6 +39,7 @@ Docker 把程序装进容器。Caddy 负责 HTTPS 证书、80/443 端口和转�
 - API_DOMAIN 和 ALLOWED_HOSTS 写你的真实域名。
 - DATABASE_URL 写 PostgreSQL 地址，JWT_SECRET 至少 32 个随机字符。
 - FAMILYAPP_FAMILY_TIMEZONE、REMOTE_SYNC_ENABLED、DEPLOY_BRANCH、DEPLOY_REMOTE 正确。
+- 若启用远端同步，FAMILYAPP_INVITE_CODE 必须换成至少 12 位的私密值，不能用示例值。
 - 本机数据库保留 DATABASE_URL 中的主机 db，并设置强的 POSTGRES_*；托管数据库就
   换成完整 DATABASE_URL，本机 db 不会启动。
 - 需要媒体才设置 FAMILYAPP_MEDIA_BACKEND=s3 和 FAMILYAPP_MEDIA_S3_*；Bucket 必须
